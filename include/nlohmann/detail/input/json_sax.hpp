@@ -1,32 +1,32 @@
 #pragma once
 
 #include <cstddef>
-#include <string>
-#include <vector>
+#include <string> // string
+#include <utility> // move
+#include <vector> // vector
 
-#include <nlohmann/detail/input/parser.hpp>
 #include <nlohmann/detail/exceptions.hpp>
+#include <nlohmann/detail/macro_scope.hpp>
 
 namespace nlohmann
 {
 
 /*!
 @brief SAX interface
+
+This class describes the SAX interface used by @ref nlohmann::json::sax_parse.
+Each function is called in different situations while the input is parsed. The
+boolean return value informs the parser whether to continue processing the
+input.
 */
 template<typename BasicJsonType>
 struct json_sax
 {
-    /// type for (signed) integers
     using number_integer_t = typename BasicJsonType::number_integer_t;
-    /// type for unsigned integers
     using number_unsigned_t = typename BasicJsonType::number_unsigned_t;
-    /// type for floating-point numbers
     using number_float_t = typename BasicJsonType::number_float_t;
-    /// type for strings
     using string_t = typename BasicJsonType::string_t;
-
-    /// constant to indicate that no size limit is given for array or object
-    static constexpr auto no_limit = std::size_t(-1);
+    using binary_t = typename BasicJsonType::binary_t;
 
     /*!
     @brief a null value was read
@@ -67,21 +67,31 @@ struct json_sax
     @brief a string was read
     @param[in] val  string value
     @return whether parsing should proceed
+    @note It is safe to move the passed string.
     */
     virtual bool string(string_t& val) = 0;
 
     /*!
+    @brief a binary string was read
+    @param[in] val  binary value
+    @return whether parsing should proceed
+    @note It is safe to move the passed binary.
+    */
+    virtual bool binary(binary_t& val) = 0;
+
+    /*!
     @brief the beginning of an object was read
-    @param[in] elements  number of object elements or no_limit if unknown
+    @param[in] elements  number of object elements or -1 if unknown
     @return whether parsing should proceed
     @note binary formats may report the number of elements
     */
-    virtual bool start_object(std::size_t elements = no_limit) = 0;
+    virtual bool start_object(std::size_t elements) = 0;
 
     /*!
     @brief an object key was read
     @param[in] val  object key
     @return whether parsing should proceed
+    @note It is safe to move the passed string.
     */
     virtual bool key(string_t& val) = 0;
 
@@ -93,11 +103,11 @@ struct json_sax
 
     /*!
     @brief the beginning of an array was read
-    @param[in] elements  number of array elements or no_limit if unknown
+    @param[in] elements  number of array elements or -1 if unknown
     @return whether parsing should proceed
     @note binary formats may report the number of elements
     */
-    virtual bool start_array(std::size_t elements = no_limit) = 0;
+    virtual bool start_array(std::size_t elements) = 0;
 
     /*!
     @brief the end of an array was read
@@ -109,7 +119,7 @@ struct json_sax
     @brief a parse error occurred
     @param[in] position    the position in the input where the error occurs
     @param[in] last_token  the last read token
-    @param[in] error_msg   a detailed error message
+    @param[in] ex          an exception object describing the error
     @return whether parsing should proceed (must return false)
     */
     virtual bool parse_error(std::size_t position,
@@ -136,64 +146,78 @@ constructor contains the parsed value.
 @tparam BasicJsonType  the JSON type
 */
 template<typename BasicJsonType>
-class json_sax_dom_parser : public json_sax<BasicJsonType>
+class json_sax_dom_parser
 {
   public:
     using number_integer_t = typename BasicJsonType::number_integer_t;
     using number_unsigned_t = typename BasicJsonType::number_unsigned_t;
     using number_float_t = typename BasicJsonType::number_float_t;
     using string_t = typename BasicJsonType::string_t;
+    using binary_t = typename BasicJsonType::binary_t;
 
     /*!
     @param[in, out] r  reference to a JSON value that is manipulated while
                        parsing
     @param[in] allow_exceptions_  whether parse errors yield exceptions
     */
-    json_sax_dom_parser(BasicJsonType& r, const bool allow_exceptions_ = true)
+    explicit json_sax_dom_parser(BasicJsonType& r, const bool allow_exceptions_ = true)
         : root(r), allow_exceptions(allow_exceptions_)
     {}
 
-    bool null() override
+    // make class move-only
+    json_sax_dom_parser(const json_sax_dom_parser&) = delete;
+    json_sax_dom_parser(json_sax_dom_parser&&) = default;
+    json_sax_dom_parser& operator=(const json_sax_dom_parser&) = delete;
+    json_sax_dom_parser& operator=(json_sax_dom_parser&&) = default;
+    ~json_sax_dom_parser() = default;
+
+    bool null()
     {
         handle_value(nullptr);
         return true;
     }
 
-    bool boolean(bool val) override
+    bool boolean(bool val)
     {
         handle_value(val);
         return true;
     }
 
-    bool number_integer(number_integer_t val) override
+    bool number_integer(number_integer_t val)
     {
         handle_value(val);
         return true;
     }
 
-    bool number_unsigned(number_unsigned_t val) override
+    bool number_unsigned(number_unsigned_t val)
     {
         handle_value(val);
         return true;
     }
 
-    bool number_float(number_float_t val, const string_t&) override
+    bool number_float(number_float_t val, const string_t& /*unused*/)
     {
         handle_value(val);
         return true;
     }
 
-    bool string(string_t& val) override
+    bool string(string_t& val)
     {
         handle_value(val);
         return true;
     }
 
-    bool start_object(std::size_t len) override
+    bool binary(binary_t& val)
+    {
+        handle_value(std::move(val));
+        return true;
+    }
+
+    bool start_object(std::size_t len)
     {
         ref_stack.push_back(handle_value(BasicJsonType::value_t::object));
 
-        if (JSON_UNLIKELY(len != json_sax<BasicJsonType>::no_limit and len > ref_stack.back()->max_size()))
+        if (JSON_HEDLEY_UNLIKELY(len != std::size_t(-1) && len > ref_stack.back()->max_size()))
         {
             JSON_THROW(out_of_range::create(408,
                                             "excessive object size: " + std::to_string(len)));
@@ -202,24 +226,24 @@ class json_sax_dom_parser : public json_sax<BasicJsonType>
         return true;
     }
 
-    bool key(string_t& val) override
+    bool key(string_t& val)
     {
         // add null at given key and store the reference for later
         object_element = &(ref_stack.back()->m_value.object->operator[](val));
         return true;
     }
 
-    bool end_object() override
+    bool end_object()
     {
         ref_stack.pop_back();
         return true;
     }
 
-    bool start_array(std::size_t len) override
+    bool start_array(std::size_t len)
     {
         ref_stack.push_back(handle_value(BasicJsonType::value_t::array));
 
-        if (JSON_UNLIKELY(len != json_sax<BasicJsonType>::no_limit and len > ref_stack.back()->max_size()))
+        if (JSON_HEDLEY_UNLIKELY(len != std::size_t(-1) && len > ref_stack.back()->max_size()))
         {
             JSON_THROW(out_of_range::create(408,
                                             "excessive array size: " + std::to_string(len)));
@@ -228,34 +252,21 @@ class json_sax_dom_parser : public json_sax<BasicJsonType>
         return true;
     }
 
-    bool end_array() override
+    bool end_array()
     {
         ref_stack.pop_back();
         return true;
     }
 
-    bool parse_error(std::size_t, const std::string&,
-                     const detail::exception& ex) override
+    template<class Exception>
+    bool parse_error(std::size_t /*unused*/, const std::string& /*unused*/,
+                     const Exception& ex)
     {
         errored = true;
+        static_cast<void>(ex);
         if (allow_exceptions)
         {
-            // determine the proper exception type from the id
-            switch ((ex.id / 100) % 100)
-            {
-                case 1:
-                    JSON_THROW(*reinterpret_cast<const detail::parse_error*>(&ex));
-                case 2:
-                    JSON_THROW(*reinterpret_cast<const detail::invalid_iterator*>(&ex));  // LCOV_EXCL_LINE
-                case 3:
-                    JSON_THROW(*reinterpret_cast<const detail::type_error*>(&ex));  // LCOV_EXCL_LINE
-                case 4:
-                    JSON_THROW(*reinterpret_cast<const detail::out_of_range*>(&ex));
-                case 5:
-                    JSON_THROW(*reinterpret_cast<const detail::other_error*>(&ex));  // LCOV_EXCL_LINE
-                default:
-                    assert(false);  // LCOV_EXCL_LINE
-            }
+            JSON_THROW(ex);
         }
         return false;
     }
@@ -273,6 +284,7 @@ class json_sax_dom_parser : public json_sax<BasicJsonType>
                object to which we can add elements
     */
     template<typename Value>
+    JSON_HEDLEY_RETURNS_NON_NULL
     BasicJsonType* handle_value(Value&& v)
     {
         if (ref_stack.empty())
@@ -280,27 +292,25 @@ class json_sax_dom_parser : public json_sax<BasicJsonType>
             root = BasicJsonType(std::forward<Value>(v));
             return &root;
         }
-        else
+
+        JSON_ASSERT(ref_stack.back()->is_array() || ref_stack.back()->is_object());
+
+        if (ref_stack.back()->is_array())
         {
-            assert(ref_stack.back()->is_array() or ref_stack.back()->is_object());
-            if (ref_stack.back()->is_array())
-            {
-                ref_stack.back()->m_value.array->emplace_back(std::forward<Value>(v));
-                return &(ref_stack.back()->m_value.array->back());
-            }
-            else
-            {
-                assert(object_element);
-                *object_element = BasicJsonType(std::forward<Value>(v));
-                return object_element;
-            }
+            ref_stack.back()->m_value.array->emplace_back(std::forward<Value>(v));
+            return &(ref_stack.back()->m_value.array->back());
         }
+
+        JSON_ASSERT(ref_stack.back()->is_object());
+        JSON_ASSERT(object_element);
+        *object_element = BasicJsonType(std::forward<Value>(v));
+        return object_element;
     }
 
     /// the parsed JSON value
     BasicJsonType& root;
     /// stack to model hierarchy of values
-    std::vector<BasicJsonType*> ref_stack;
+    std::vector<BasicJsonType*> ref_stack {};
     /// helper to hold the reference for the next object element
     BasicJsonType* object_element = nullptr;
     /// whether a syntax error occurred
@@ -310,13 +320,14 @@ class json_sax_dom_parser : public json_sax<BasicJsonType>
 };
 
 template<typename BasicJsonType>
-class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
+class json_sax_dom_callback_parser
 {
   public:
     using number_integer_t = typename BasicJsonType::number_integer_t;
     using number_unsigned_t = typename BasicJsonType::number_unsigned_t;
     using number_float_t = typename BasicJsonType::number_float_t;
     using string_t = typename BasicJsonType::string_t;
+    using binary_t = typename BasicJsonType::binary_t;
     using parser_callback_t = typename BasicJsonType::parser_callback_t;
     using parse_event_t = typename BasicJsonType::parse_event_t;
 
@@ -328,43 +339,56 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
         keep_stack.push_back(true);
     }
 
-    bool null() override
+    // make class move-only
+    json_sax_dom_callback_parser(const json_sax_dom_callback_parser&) = delete;
+    json_sax_dom_callback_parser(json_sax_dom_callback_parser&&) = default;
+    json_sax_dom_callback_parser& operator=(const json_sax_dom_callback_parser&) = delete;
+    json_sax_dom_callback_parser& operator=(json_sax_dom_callback_parser&&) = default;
+    ~json_sax_dom_callback_parser() = default;
+
+    bool null()
     {
         handle_value(nullptr);
         return true;
     }
 
-    bool boolean(bool val) override
+    bool boolean(bool val)
     {
         handle_value(val);
         return true;
     }
 
-    bool number_integer(number_integer_t val) override
+    bool number_integer(number_integer_t val)
     {
         handle_value(val);
         return true;
     }
 
-    bool number_unsigned(number_unsigned_t val) override
+    bool number_unsigned(number_unsigned_t val)
     {
         handle_value(val);
         return true;
     }
 
-    bool number_float(number_float_t val, const string_t&) override
+    bool number_float(number_float_t val, const string_t& /*unused*/)
     {
         handle_value(val);
         return true;
     }
 
-    bool string(string_t& val) override
+    bool string(string_t& val)
     {
         handle_value(val);
         return true;
     }
 
-    bool start_object(std::size_t len) override
+    bool binary(binary_t& val)
+    {
+        handle_value(std::move(val));
+        return true;
+    }
+
+    bool start_object(std::size_t len)
     {
         // check callback for object start
         const bool keep = callback(static_cast<int>(ref_stack.size()), parse_event_t::object_start, discarded);
@@ -374,19 +398,15 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
         ref_stack.push_back(val.second);
 
         // check object limit
-        if (ref_stack.back())
+        if (ref_stack.back() && JSON_HEDLEY_UNLIKELY(len != std::size_t(-1) && len > ref_stack.back()->max_size()))
         {
-            if (JSON_UNLIKELY(len != json_sax<BasicJsonType>::no_limit and len > ref_stack.back()->max_size()))
-            {
-                JSON_THROW(out_of_range::create(408,
-                                                "excessive object size: " + std::to_string(len)));
-            }
+            JSON_THROW(out_of_range::create(408, "excessive object size: " + std::to_string(len)));
         }
 
         return true;
     }
 
-    bool key(string_t& val) override
+    bool key(string_t& val)
     {
         BasicJsonType k = BasicJsonType(val);
 
@@ -395,7 +415,7 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
         key_keep_stack.push_back(keep);
 
         // add discarded value at given key and store the reference for later
-        if (keep and ref_stack.back())
+        if (keep && ref_stack.back())
         {
             object_element = &(ref_stack.back()->m_value.object->operator[](val) = discarded);
         }
@@ -403,34 +423,28 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
         return true;
     }
 
-    bool end_object() override
+    bool end_object()
     {
-        if (ref_stack.back())
+        if (ref_stack.back() && !callback(static_cast<int>(ref_stack.size()) - 1, parse_event_t::object_end, *ref_stack.back()))
         {
-            if (not callback(static_cast<int>(ref_stack.size()) - 1, parse_event_t::object_end, *ref_stack.back()))
-            {
-                // discard object
-                *ref_stack.back() = discarded;
-            }
+            // discard object
+            *ref_stack.back() = discarded;
         }
 
-        assert(not ref_stack.empty());
-        assert(not keep_stack.empty());
+        JSON_ASSERT(!ref_stack.empty());
+        JSON_ASSERT(!keep_stack.empty());
         ref_stack.pop_back();
         keep_stack.pop_back();
 
-        if (not ref_stack.empty() and ref_stack.back())
+        if (!ref_stack.empty() && ref_stack.back() && ref_stack.back()->is_structured())
         {
             // remove discarded value
-            if (ref_stack.back()->is_object())
+            for (auto it = ref_stack.back()->begin(); it != ref_stack.back()->end(); ++it)
             {
-                for (auto it = ref_stack.back()->begin(); it != ref_stack.back()->end(); ++it)
+                if (it->is_discarded())
                 {
-                    if (it->is_discarded())
-                    {
-                        ref_stack.back()->erase(it);
-                        break;
-                    }
+                    ref_stack.back()->erase(it);
+                    break;
                 }
             }
         }
@@ -438,7 +452,7 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
         return true;
     }
 
-    bool start_array(std::size_t len) override
+    bool start_array(std::size_t len)
     {
         const bool keep = callback(static_cast<int>(ref_stack.size()), parse_event_t::array_start, discarded);
         keep_stack.push_back(keep);
@@ -447,71 +461,51 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
         ref_stack.push_back(val.second);
 
         // check array limit
-        if (ref_stack.back())
+        if (ref_stack.back() && JSON_HEDLEY_UNLIKELY(len != std::size_t(-1) && len > ref_stack.back()->max_size()))
         {
-            if (JSON_UNLIKELY(len != json_sax<BasicJsonType>::no_limit and len > ref_stack.back()->max_size()))
-            {
-                JSON_THROW(out_of_range::create(408,
-                                                "excessive array size: " + std::to_string(len)));
-            }
+            JSON_THROW(out_of_range::create(408, "excessive array size: " + std::to_string(len)));
         }
 
         return true;
     }
 
-    bool end_array() override
+    bool end_array()
     {
         bool keep = true;
 
         if (ref_stack.back())
         {
             keep = callback(static_cast<int>(ref_stack.size()) - 1, parse_event_t::array_end, *ref_stack.back());
-            if (not keep)
+            if (!keep)
             {
                 // discard array
                 *ref_stack.back() = discarded;
             }
         }
 
-        assert(not ref_stack.empty());
-        assert(not keep_stack.empty());
+        JSON_ASSERT(!ref_stack.empty());
+        JSON_ASSERT(!keep_stack.empty());
         ref_stack.pop_back();
         keep_stack.pop_back();
 
         // remove discarded value
-        if (not keep and not ref_stack.empty())
+        if (!keep && !ref_stack.empty() && ref_stack.back()->is_array())
         {
-            if (ref_stack.back()->is_array())
-            {
-                ref_stack.back()->m_value.array->pop_back();
-            }
+            ref_stack.back()->m_value.array->pop_back();
         }
 
         return true;
     }
 
-    bool parse_error(std::size_t, const std::string&,
-                     const detail::exception& ex) override
+    template<class Exception>
+    bool parse_error(std::size_t /*unused*/, const std::string& /*unused*/,
+                     const Exception& ex)
     {
         errored = true;
+        static_cast<void>(ex);
         if (allow_exceptions)
         {
-            // determine the proper exception type from the id
-            switch ((ex.id / 100) % 100)
-            {
-                case 1:
-                    JSON_THROW(*reinterpret_cast<const detail::parse_error*>(&ex));
-                case 2:
-                    JSON_THROW(*reinterpret_cast<const detail::invalid_iterator*>(&ex));  // LCOV_EXCL_LINE
-                case 3:
-                    JSON_THROW(*reinterpret_cast<const detail::type_error*>(&ex));  // LCOV_EXCL_LINE
-                case 4:
-                    JSON_THROW(*reinterpret_cast<const detail::out_of_range*>(&ex));
-                case 5:
-                    JSON_THROW(*reinterpret_cast<const detail::other_error*>(&ex));  // LCOV_EXCL_LINE
-                default:
-                    assert(false);  // LCOV_EXCL_LINE
-            }
+            JSON_THROW(ex);
         }
         return false;
     }
@@ -540,11 +534,11 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
     template<typename Value>
     std::pair<bool, BasicJsonType*> handle_value(Value&& v, const bool skip_callback = false)
     {
-        assert(not keep_stack.empty());
+        JSON_ASSERT(!keep_stack.empty());
 
         // do not handle this value if we know it would be added to a discarded
         // container
-        if (not keep_stack.back())
+        if (!keep_stack.back())
         {
             return {false, nullptr};
         }
@@ -553,10 +547,10 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
         auto value = BasicJsonType(std::forward<Value>(v));
 
         // check callback
-        const bool keep = skip_callback or callback(static_cast<int>(ref_stack.size()), parse_event_t::value, value);
+        const bool keep = skip_callback || callback(static_cast<int>(ref_stack.size()), parse_event_t::value, value);
 
         // do not handle this value if we just learnt it shall be discarded
-        if (not keep)
+        if (!keep)
         {
             return {false, nullptr};
         }
@@ -566,41 +560,49 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
             root = std::move(value);
             return {true, &root};
         }
-        else
+
+        // skip this value if we already decided to skip the parent
+        // (https://github.com/nlohmann/json/issues/971#issuecomment-413678360)
+        if (!ref_stack.back())
         {
-            assert(ref_stack.back()->is_array() or ref_stack.back()->is_object());
-            if (ref_stack.back()->is_array())
-            {
-                ref_stack.back()->m_value.array->push_back(std::move(value));
-                return {true, &(ref_stack.back()->m_value.array->back())};
-            }
-            else
-            {
-                // check if we should store an element for the current key
-                assert(not key_keep_stack.empty());
-                const bool store_element = key_keep_stack.back();
-                key_keep_stack.pop_back();
-
-                if (not store_element)
-                {
-                    return {false, nullptr};
-                }
-
-                assert(object_element);
-                *object_element = std::move(value);
-                return {true, object_element};
-            }
+            return {false, nullptr};
         }
+
+        // we now only expect arrays and objects
+        JSON_ASSERT(ref_stack.back()->is_array() || ref_stack.back()->is_object());
+
+        // array
+        if (ref_stack.back()->is_array())
+        {
+            ref_stack.back()->m_value.array->push_back(std::move(value));
+            return {true, &(ref_stack.back()->m_value.array->back())};
+        }
+
+        // object
+        JSON_ASSERT(ref_stack.back()->is_object());
+        // check if we should store an element for the current key
+        JSON_ASSERT(!key_keep_stack.empty());
+        const bool store_element = key_keep_stack.back();
+        key_keep_stack.pop_back();
+
+        if (!store_element)
+        {
+            return {false, nullptr};
+        }
+
+        JSON_ASSERT(object_element);
+        *object_element = std::move(value);
+        return {true, object_element};
     }
 
     /// the parsed JSON value
     BasicJsonType& root;
     /// stack to model hierarchy of values
-    std::vector<BasicJsonType*> ref_stack;
+    std::vector<BasicJsonType*> ref_stack {};
     /// stack to manage which values to keep
-    std::vector<bool> keep_stack;
+    std::vector<bool> keep_stack {};
     /// stack to manage which object keys to keep
-    std::vector<bool> key_keep_stack;
+    std::vector<bool> key_keep_stack {};
     /// helper to hold the reference for the next object element
     BasicJsonType* object_element = nullptr;
     /// whether a syntax error occurred
@@ -614,74 +616,80 @@ class json_sax_dom_callback_parser : public json_sax<BasicJsonType>
 };
 
 template<typename BasicJsonType>
-class json_sax_acceptor : public json_sax<BasicJsonType>
+class json_sax_acceptor
 {
   public:
     using number_integer_t = typename BasicJsonType::number_integer_t;
     using number_unsigned_t = typename BasicJsonType::number_unsigned_t;
     using number_float_t = typename BasicJsonType::number_float_t;
     using string_t = typename BasicJsonType::string_t;
+    using binary_t = typename BasicJsonType::binary_t;
 
-    bool null() override
+    bool null()
     {
         return true;
     }
 
-    bool boolean(bool) override
+    bool boolean(bool /*unused*/)
     {
         return true;
     }
 
-    bool number_integer(number_integer_t) override
+    bool number_integer(number_integer_t /*unused*/)
     {
         return true;
     }
 
-    bool number_unsigned(number_unsigned_t) override
+    bool number_unsigned(number_unsigned_t /*unused*/)
     {
         return true;
     }
 
-    bool number_float(number_float_t, const string_t&) override
+    bool number_float(number_float_t /*unused*/, const string_t& /*unused*/)
     {
         return true;
     }
 
-    bool string(string_t&) override
+    bool string(string_t& /*unused*/)
     {
         return true;
     }
 
-    bool start_object(std::size_t) override
+    bool binary(binary_t& /*unused*/)
     {
         return true;
     }
 
-    bool key(string_t&) override
+    bool start_object(std::size_t /*unused*/ = std::size_t(-1))
     {
         return true;
     }
 
-    bool end_object() override
+    bool key(string_t& /*unused*/)
     {
         return true;
     }
 
-    bool start_array(std::size_t) override
+    bool end_object()
     {
         return true;
     }
 
-    bool end_array() override
+    bool start_array(std::size_t /*unused*/ = std::size_t(-1))
     {
         return true;
     }
 
-    bool parse_error(std::size_t, const std::string&, const detail::exception&) override
+    bool end_array()
+    {
+        return true;
+    }
+
+    bool parse_error(std::size_t /*unused*/, const std::string& /*unused*/, const detail::exception& /*unused*/)
     {
         return false;
     }
 };
-}
+}  // namespace detail
 
-}
+}  // namespace nlohmann
